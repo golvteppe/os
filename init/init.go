@@ -302,9 +302,13 @@ func RunInit() error {
 				log.Error(err)
 			}
 
+			log.Debug("init: runCloudInitServices()")
 			if err := runCloudInitServices(cfg); err != nil {
 				log.Error(err)
 			}
+
+			// return any newly detected network config.
+			cfg = config.LoadConfig()
 
 			return cfg, nil
 		},

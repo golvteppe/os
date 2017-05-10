@@ -53,7 +53,7 @@ func osSubcommands() []cli.Command {
 					Usage: "do not reboot after upgrade",
 				},
 				cli.BoolFlag{
-					Name:  "kexec",
+					Name:  "kexec, k",
 					Usage: "reboot using kexec",
 				},
 				cli.StringFlag{
@@ -63,6 +63,10 @@ func osSubcommands() []cli.Command {
 				cli.BoolFlag{
 					Name:  "upgrade-console",
 					Usage: "upgrade console even if persistent",
+				},
+				cli.BoolFlag{
+					Name:  "debug",
+					Usage: "Run installer with debug output",
 				},
 			},
 		},
@@ -187,7 +191,16 @@ func osUpgrade(c *cli.Context) error {
 	if c.Args().Present() {
 		log.Fatalf("invalid arguments %v", c.Args())
 	}
-	if err := startUpgradeContainer(image, c.Bool("stage"), c.Bool("force"), !c.Bool("no-reboot"), c.Bool("kexec"), c.Bool("upgrade-console"), c.String("append")); err != nil {
+	if err := startUpgradeContainer(
+		image,
+		c.Bool("stage"),
+		c.Bool("force"),
+		!c.Bool("no-reboot"),
+		c.Bool("kexec"),
+		c.Bool("upgrade-console"),
+		c.Bool("debug"),
+		c.String("append"),
+	); err != nil {
 		log.Fatal(err)
 	}
 
@@ -199,14 +212,17 @@ func osVersion(c *cli.Context) error {
 	return nil
 }
 
-func startUpgradeContainer(image string, stage, force, reboot, kexec bool, upgradeConsole bool, kernelArgs string) error {
+func startUpgradeContainer(image string, stage, force, reboot, kexec, debug bool, upgradeConsole bool, kernelArgs string) error {
 	command := []string{
-		"-t", "upgrade",
+		"-t", "rancher-upgrade",
 		"-r", config.Version,
 	}
 
 	if kexec {
-		command = append(command, "-k")
+		command = append(command, "--kexec")
+	}
+	if debug {
+		command = append(command, "--debug")
 	}
 
 	kernelArgs = strings.TrimSpace(kernelArgs)

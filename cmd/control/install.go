@@ -51,6 +51,14 @@ var installCommand = cli.Command{
 			Name:  "device, d",
 			Usage: "storage device",
 		},
+		cli.StringFlag{
+			Name:  "partition, p",
+			Usage: "partition to install to",
+		},
+		cli.StringFlag{
+			Name:  "statedir",
+			Usage: "install to rancher.state.directory",
+		},
 		cli.BoolFlag{
 			Name:  "force, f",
 			Usage: "[ DANGEROUS! Data loss can happen ] partition/format without prompting",
@@ -74,7 +82,7 @@ var installCommand = cli.Command{
 			Hidden: true,
 		},
 		cli.BoolFlag{
-			Name:  "kexec",
+			Name:  "kexec, k",
 			Usage: "reboot using kexec",
 		},
 		cli.BoolFlag{
@@ -93,7 +101,8 @@ func installAction(c *cli.Context) error {
 		log.Fatalf("invalid arguments %v", c.Args())
 	}
 
-	if c.Bool("debug") {
+	debug := c.Bool("debug")
+	if debug {
 		originalLevel := log.GetLevel()
 		defer log.SetLevel(originalLevel)
 		log.SetLevel(log.DebugLevel)
@@ -124,6 +133,11 @@ func installAction(c *cli.Context) error {
 		isoinstallerloaded = true // OMG this flag is aweful - kill it with fire
 	}
 	device := c.String("device")
+	partition := c.String("partition")
+	statedir := c.String("statedir")
+	if statedir != "" && installType != "noformat" {
+		log.Fatal("--statedir %s requires --type noformat", statedir)
+	}
 	if installType != "noformat" &&
 		installType != "raid" &&
 		installType != "bootstrap" &&
@@ -141,14 +155,15 @@ func installAction(c *cli.Context) error {
 			log.Warn("Cloud-config not provided: you might need to provide cloud-config on bootDir with ssh_authorized_keys")
 		}
 	} else {
+		os.MkdirAll("/opt", 0755)
 		uc := "/opt/user_config.yml"
 		if err := util.FileCopy(cloudConfig, uc); err != nil {
-			log.WithFields(log.Fields{"cloudConfig": cloudConfig}).Fatal("Failed to copy cloud-config")
+			log.WithFields(log.Fields{"cloudConfig": cloudConfig, "error": err}).Fatal("Failed to copy cloud-config")
 		}
 		cloudConfig = uc
 	}
 
-	if err := runInstall(image, installType, cloudConfig, device, kappend, force, kexec, isoinstallerloaded); err != nil {
+	if err := runInstall(image, installType, cloudConfig, device, partition, statedir, kappend, force, kexec, isoinstallerloaded, debug); err != nil {
 		log.WithFields(log.Fields{"err": err}).Fatal("Failed to run install")
 		return err
 	}
@@ -161,7 +176,7 @@ func installAction(c *cli.Context) error {
 	return nil
 }
 
-func runInstall(image, installType, cloudConfig, device, kappend string, force, kexec, isoinstallerloaded bool) error {
+func runInstall(image, installType, cloudConfig, device, partition, statedir, kappend string, force, kexec, isoinstallerloaded, debug bool) error {
 	fmt.Printf("Installing from %s\n", image)
 
 	if !force {
@@ -272,6 +287,15 @@ func runInstall(image, installType, cloudConfig, device, kappend string, force, 
 			if kexec {
 				installerCmd = append(installerCmd, "--kexec")
 			}
+			if debug {
+				installerCmd = append(installerCmd, "--debug")
+			}
+			if partition != "" {
+				installerCmd = append(installerCmd, "--partition", partition)
+			}
+			if statedir != "" {
+				installerCmd = append(installerCmd, "--statedir", statedir)
+			}
 
 			// TODO: mount at /mnt for shared mount?
 			if useIso {
@@ -294,21 +318,26 @@ func runInstall(image, installType, cloudConfig, device, kappend string, force, 
 
 	log.Debugf("running installation")
 
-	if installType == "generic" ||
-		installType == "syslinux" ||
-		installType == "gptsyslinux" {
-		diskType := "msdos"
-		if installType == "gptsyslinux" {
-			diskType = "gpt"
+	if partition == "" {
+		if installType == "generic" ||
+			installType == "syslinux" ||
+			installType == "gptsyslinux" {
+			diskType := "msdos"
+			if installType == "gptsyslinux" {
+				diskType = "gpt"
+			}
+			log.Debugf("running setDiskpartitions")
+			err := setDiskpartitions(device, diskType)
+			if err != nil {
+				log.Errorf("error setDiskpartitions %s", err)
+				return err
+			}
+			// use the bind mounted host filesystem to get access to the /dev/vda1 device that udev on the host sets up (TODO: can we run a udevd inside the container? `mknod b 253 1 /dev/vda1` doesn't work)
+			device = "/host" + device
+			//# TODO: Change this to a number so that users can specify.
+			//# Will need to make it so that our builds and packer APIs remain consistent.
+			partition = device + "1" //${partition:=${device}1}
 		}
-		log.Debugf("running setDiskpartitions")
-		err := setDiskpartitions(device, diskType)
-		if err != nil {
-			log.Errorf("error setDiskpartitions %s", err)
-			return err
-		}
-		// use the bind mounted host filesystem to get access to the /dev/vda1 device that udev on the host sets up (TODO: can we run a udevd inside the container? `mknod b 253 1 /dev/vda1` doesn't work)
-		device = "/host" + device
 	}
 
 	if installType == "upgrade" {
@@ -320,11 +349,11 @@ func runInstall(image, installType, cloudConfig, device, kappend string, force, 
 		// TODO: detect if its not mounted and then optionally mount?
 		if err := mountBootIso(); err != nil {
 			log.Errorf("error mountBootIso %s", err)
-			return err
+			//return err
 		}
 	}
 
-	err := layDownOS(image, installType, cloudConfig, device, kappend, kexec)
+	err := layDownOS(image, installType, cloudConfig, device, partition, statedir, kappend, kexec)
 	if err != nil {
 		log.Errorf("error layDownOS %s", err)
 		return err
@@ -336,48 +365,25 @@ func runInstall(image, installType, cloudConfig, device, kappend string, force, 
 func mountBootIso() error {
 	deviceName := "/dev/sr0"
 	deviceType := "iso9660"
-	{ // force the defer
-		mountsFile, err := os.Open("/proc/mounts")
-		if err != nil {
-			log.Errorf("failed to read /proc/mounts %s", err)
-			return err
-		}
-		defer mountsFile.Close()
+	if d, t := util.Blkid("RancherOS"); d != "" {
+		deviceName = d
+		deviceType = t
+	}
 
-		if partitionMounted(deviceName, mountsFile) {
-			return nil
-		}
+	mountsFile, err := os.Open("/proc/mounts")
+	if err != nil {
+		log.Errorf("failed to read /proc/mounts %s", err)
+		return err
+	}
+	defer mountsFile.Close()
+
+	if partitionMounted(deviceName, mountsFile) {
+		return nil
 	}
 
 	os.MkdirAll("/bootiso", 0755)
-
-	// find the installation device
-	cmd := exec.Command("blkid", "-L", "RancherOS")
-	log.Debugf("Run(%v)", cmd)
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
-	if err != nil {
-		log.Errorf("Failed to get RancherOS boot device: %s", err)
-		return err
-	}
-	deviceName = strings.TrimSpace(string(out))
-	log.Debugf("blkid found -L RancherOS: %s", deviceName)
-
-	cmd = exec.Command("blkid", deviceName)
-	log.Debugf("Run(%v)", cmd)
-	cmd.Stderr = os.Stderr
-	if out, err = cmd.Output(); err != nil {
-		log.Errorf("Failed to get RancherOS boot device type: %s", err)
-		return err
-	}
-	deviceType = strings.TrimSpace(string(out))
-	s1 := strings.Split(deviceType, "TYPE=\"")
-	s2 := strings.Split(s1[1], "\"")
-	deviceType = s2[0]
-	log.Debugf("blkid type of %s: %s", deviceName, deviceType)
-
-	cmd = exec.Command("mount", "-t", deviceType, deviceName, "/bootiso")
-	log.Debugf("Run(%v)", cmd)
+	cmd := exec.Command("mount", "-t", deviceType, deviceName, "/bootiso")
+	log.Debugf("mount (%#v)", cmd)
 
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	err = cmd.Run()
@@ -389,7 +395,7 @@ func mountBootIso() error {
 	return err
 }
 
-func layDownOS(image, installType, cloudConfig, device, kappend string, kexec bool) error {
+func layDownOS(image, installType, cloudConfig, device, partition, statedir, kappend string, kexec bool) error {
 	// ENV == installType
 	//[[ "$ARCH" == "arm" && "$ENV" != "upgrade" ]] && ENV=arm
 
@@ -403,10 +409,10 @@ func layDownOS(image, installType, cloudConfig, device, kappend string, kexec bo
 	CONSOLE := "tty0"
 	baseName := "/mnt/new_img"
 	bootDir := "boot/"
-	//# TODO: Change this to a number so that users can specify.
-	//# Will need to make it so that our builds and packer APIs remain consistent.
-	partition := device + "1"                                                //${partition:=${device}1}
-	kernelArgs := "rancher.state.dev=LABEL=RANCHER_STATE rancher.state.wait" // console="+CONSOLE
+	kernelArgs := "printk.devkmsg=on rancher.state.dev=LABEL=RANCHER_STATE rancher.state.wait" // console="+CONSOLE
+	if statedir != "" {
+		kernelArgs = kernelArgs + " rancher.state.directory=" + statedir
+	}
 
 	// unmount on trap
 	defer util.Unmount(baseName)
@@ -471,14 +477,17 @@ func layDownOS(image, installType, cloudConfig, device, kappend string, kexec bo
 		seedData(baseName, cloudConfig, FILES)
 	case "noformat":
 		var err error
-		device, partition, err = mountdevice(baseName, bootDir, partition, false)
+		device, partition, err = mountdevice(baseName, bootDir, device, partition, false)
 		if err != nil {
 			return err
 		}
 		installSyslinux(device, baseName, bootDir, diskType)
+		if err := os.MkdirAll(filepath.Join(baseName, statedir), 0755); err != nil {
+			return err
+		}
 	case "raid":
 		var err error
-		device, partition, err = mountdevice(baseName, bootDir, partition, false)
+		device, partition, err = mountdevice(baseName, bootDir, device, partition, false)
 		if err != nil {
 			return err
 		}
@@ -486,7 +495,7 @@ func layDownOS(image, installType, cloudConfig, device, kappend string, kexec bo
 	case "bootstrap":
 		CONSOLE = "ttyS0"
 		var err error
-		device, partition, err = mountdevice(baseName, bootDir, partition, true)
+		device, partition, err = mountdevice(baseName, bootDir, device, partition, true)
 		if err != nil {
 			return err
 		}
@@ -496,7 +505,7 @@ func layDownOS(image, installType, cloudConfig, device, kappend string, kexec bo
 		fallthrough
 	case "upgrade":
 		var err error
-		device, partition, err = mountdevice(baseName, bootDir, partition, false)
+		device, partition, err = mountdevice(baseName, bootDir, device, partition, false)
 		if err != nil {
 			return err
 		}
@@ -528,7 +537,7 @@ func layDownOS(image, installType, cloudConfig, device, kappend string, kexec bo
 		install.PvGrubConfig(menu)
 	}
 	log.Debugf("installRancher")
-	err := installRancher(baseName, bootDir, VERSION, DIST, kernelArgs+" "+kappend)
+	currentCfg, err := installRancher(baseName, bootDir, VERSION, DIST, kernelArgs+" "+kappend)
 	if err != nil {
 		log.Errorf("%s", err)
 		return err
@@ -537,12 +546,19 @@ func layDownOS(image, installType, cloudConfig, device, kappend string, kexec bo
 
 	// Used by upgrade
 	if kexec {
+		vmlinuzFile, initrdFile, err := readSyslinuxCfg(currentCfg)
+		if err != nil {
+			log.Errorf("%s", err)
+			return err
+		}
 		//    kexec -l ${DIST}/vmlinuz --initrd=${DIST}/initrd --append="${kernelArgs} ${APPEND}" -f
-		cmd := exec.Command("kexec", "-l "+DIST+"/vmlinuz",
-			"--initrd="+DIST+"/initrd",
-			"--append='"+kernelArgs+" "+kappend+"'",
+		cmd := exec.Command(
+			"kexec",
+			"-l", DIST+"/"+vmlinuzFile,
+			"--initrd", DIST+"/"+initrdFile,
+			"--append", "'"+kernelArgs+" "+kappend+"'",
 			"-f")
-		log.Debugf("Run(%v)", cmd)
+		log.Debugf("Run(%#v)", cmd)
 		cmd.Stderr = os.Stderr
 		if _, err := cmd.Output(); err != nil {
 			log.Errorf("Failed to kexec: %s", err)
@@ -552,6 +568,31 @@ func layDownOS(image, installType, cloudConfig, device, kappend string, kexec bo
 	}
 
 	return nil
+}
+
+func readSyslinuxCfg(currentCfg string) (string, string, error) {
+	vmlinuzFile := ""
+	initrdFile := ""
+	// Need to parse currentCfg for the lines:
+	// KERNEL ../vmlinuz-4.9.18-rancher^M
+	// INITRD ../initrd-41e02e6-dirty^M
+	buf, err := ioutil.ReadFile(currentCfg)
+	if err != nil {
+		return vmlinuzFile, initrdFile, err
+	}
+	s := bufio.NewScanner(bytes.NewReader(buf))
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if strings.HasPrefix(line, "KERNEL") {
+			vmlinuzFile = strings.TrimSpace(strings.TrimPrefix(line, "KERNEL"))
+			vmlinuzFile = filepath.Base(vmlinuzFile)
+		}
+		if strings.HasPrefix(line, "INITRD") {
+			initrdFile = strings.TrimSpace(strings.TrimPrefix(line, "INITRD"))
+			initrdFile = filepath.Base(initrdFile)
+		}
+	}
+	return vmlinuzFile, initrdFile, err
 }
 
 // files is an array of 'sourcefile:destination' - but i've not seen any examples of it being used.
@@ -729,59 +770,55 @@ func formatdevice(device, partition string) error {
 	return nil
 }
 
-func mountdevice(baseName, bootDir, partition string, raw bool) (string, string, error) {
+func mountdevice(baseName, bootDir, device, partition string, raw bool) (string, string, error) {
 	log.Debugf("mountdevice %s, raw %v", partition, raw)
 
-	if raw {
-		log.Debugf("util.Mount (raw) %s, %s", partition, baseName)
+	if partition == "" {
+		if raw {
+			log.Debugf("util.Mount (raw) %s, %s", partition, baseName)
 
+			cmd := exec.Command("lsblk", "-no", "pkname", partition)
+			log.Debugf("Run(%v)", cmd)
+			cmd.Stderr = os.Stderr
+			device := ""
+			// TODO: out can == "" - this is used to "detect software RAID" which is terrible
+			if out, err := cmd.Output(); err == nil {
+				device = "/dev/" + strings.TrimSpace(string(out))
+			}
+
+			log.Debugf("mountdevice return -> d: %s, p: %s", device, partition)
+			return device, partition, util.Mount(partition, baseName, "", "")
+		}
+
+		//rootfs := partition
+		// Don't use ResolveDevice - it can fail, whereas `blkid -L LABEL` works more often
+
+		cfg := config.LoadConfig()
+		if d, _ := util.Blkid("RANCHER_BOOT"); d != "" {
+			partition = d
+			baseName = filepath.Join(baseName, "boot")
+		} else {
+			if dev := util.ResolveDevice(cfg.Rancher.State.Dev); dev != "" {
+				// try the rancher.state.dev setting
+				partition = dev
+			} else {
+				if d, _ := util.Blkid("RANCHER_STATE"); d != "" {
+					partition = d
+				}
+			}
+		}
 		cmd := exec.Command("lsblk", "-no", "pkname", partition)
 		log.Debugf("Run(%v)", cmd)
 		cmd.Stderr = os.Stderr
-		device := ""
+		// TODO: out can == "" - this is used to "detect software RAID" which is terrible
 		if out, err := cmd.Output(); err == nil {
 			device = "/dev/" + strings.TrimSpace(string(out))
 		}
-
-		return device, partition, util.Mount(partition, baseName, "", "")
 	}
-
-	//rootfs := partition
-	// Don't use ResolveDevice - it can fail, whereas `blkid -L LABEL` works more often
-
-	cfg := config.LoadConfig()
-	cmd := exec.Command("blkid", "-L", "RANCHER_BOOT")
-	log.Debugf("Run(%v)", cmd)
-	cmd.Stderr = os.Stderr
-	if out, err := cmd.Output(); err == nil {
-		partition = strings.TrimSpace(string(out))
-		baseName = filepath.Join(baseName, "boot")
-	} else {
-		if dev := util.ResolveDevice(cfg.Rancher.State.Dev); dev != "" {
-			// try the rancher.state.dev setting
-			partition = dev
-		} else {
-			cmd := exec.Command("blkid", "-L", "RANCHER_STATE")
-			log.Debugf("Run(%v)", cmd)
-			cmd.Stderr = os.Stderr
-			if out, err := cmd.Output(); err == nil {
-				partition = strings.TrimSpace(string(out))
-			}
-		}
-	}
-	device := ""
-	cmd = exec.Command("lsblk", "-no", "pkname", partition)
-	log.Debugf("Run(%v)", cmd)
-	cmd.Stderr = os.Stderr
-	if out, err := cmd.Output(); err == nil {
-		device = "/dev/" + strings.TrimSpace(string(out))
-	}
-
-	log.Debugf("util.Mount %s, %s", partition, baseName)
 	os.MkdirAll(baseName, 0755)
-	cmd = exec.Command("mount", partition, baseName)
-	log.Debugf("Run(%v)", cmd)
+	cmd := exec.Command("mount", partition, baseName)
 	//cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	log.Debugf("mountdevice return2 -> d: %s, p: %s", device, partition)
 	return device, partition, cmd.Run()
 }
 
@@ -793,7 +830,7 @@ func formatAndMount(baseName, bootDir, device, partition string) (string, string
 		log.Errorf("formatdevice %s", err)
 		return device, partition, err
 	}
-	device, partition, err = mountdevice(baseName, bootDir, partition, false)
+	device, partition, err = mountdevice(baseName, bootDir, device, partition, false)
 	if err != nil {
 		log.Errorf("mountdevice %s", err)
 		return device, partition, err
@@ -853,9 +890,21 @@ func upgradeBootloader(device, baseName, bootDir, diskType string) error {
 		return err
 	}
 	backupSyslinuxDir := filepath.Join(baseName, bootDir+"syslinux_backup")
-	if err := os.RemoveAll(backupSyslinuxDir); err != nil {
-		log.Errorf("RemoveAll (%s): %s", backupSyslinuxDir, err)
-		return err
+	if _, err := os.Stat(backupSyslinuxDir); !os.IsNotExist(err) {
+		backupSyslinuxLdlinuxSys := filepath.Join(backupSyslinuxDir, "ldlinux.sys")
+		if _, err := os.Stat(backupSyslinuxLdlinuxSys); !os.IsNotExist(err) {
+			//need a privileged container that can chattr -i ldlinux.sys
+			cmd := exec.Command("chattr", "-i", backupSyslinuxLdlinuxSys)
+			if err := cmd.Run(); err != nil {
+				log.Errorf("%s", err)
+				return err
+			}
+		}
+
+		if err := os.RemoveAll(backupSyslinuxDir); err != nil {
+			log.Errorf("RemoveAll (%s): %s", backupSyslinuxDir, err)
+			return err
+		}
 	}
 
 	if err := os.Rename(grubDir, grubBackup); err != nil {
@@ -890,6 +939,7 @@ func upgradeBootloader(device, baseName, bootDir, diskType string) error {
 				for _, line := range lines {
 					line = strings.TrimSpace(line)
 					if strings.HasPrefix(line, "APPEND") {
+						log.Errorf("write new (%s) %s", filepath.Join(baseName, bootDir, "global.cfg"), err)
 						// TODO: need to append any extra's the user specified
 						ioutil.WriteFile(filepath.Join(baseName, bootDir, "global.cfg"), []byte(cfg), 0644)
 						break
@@ -903,6 +953,7 @@ func upgradeBootloader(device, baseName, bootDir, diskType string) error {
 }
 
 func installSyslinux(device, baseName, bootDir, diskType string) error {
+	log.Debugf("installSyslinux(%s)", device)
 
 	mbrFile := "mbr.bin"
 	if diskType == "gpt" {
@@ -984,7 +1035,7 @@ func installSyslinux(device, baseName, bootDir, diskType string) error {
 	return nil
 }
 
-func installRancher(baseName, bootDir, VERSION, DIST, kappend string) error {
+func installRancher(baseName, bootDir, VERSION, DIST, kappend string) (string, error) {
 	log.Debugf("installRancher")
 
 	// detect if there already is a linux-current.cfg, if so, move it to linux-previous.cfg,
@@ -993,10 +1044,11 @@ func installRancher(baseName, bootDir, VERSION, DIST, kappend string) error {
 		previousCfg := filepath.Join(baseName, bootDir, "linux-previous.cfg")
 		if _, err := os.Stat(previousCfg); !os.IsNotExist(err) {
 			if err := os.Remove(previousCfg); err != nil {
-				return err
+				return currentCfg, err
 			}
 		}
 		os.Rename(currentCfg, previousCfg)
+		// TODO: now that we're parsing syslinux.cfg files, maybe we can delete old kernels and initrds
 	}
 
 	// The image/ISO have all the files in it - the syslinux cfg's and the kernel&initrd, so we can copy them all from there
@@ -1009,7 +1061,6 @@ func installRancher(baseName, bootDir, VERSION, DIST, kappend string) error {
 			log.Errorf("copy %s: %s", file.Name(), err)
 			//return err
 		}
-		log.Debugf("copied %s to %s as %s", filepath.Join(DIST, file.Name()), filepath.Join(baseName, bootDir), file.Name())
 	}
 	// the general INCLUDE syslinuxcfg
 	if err := dfs.CopyFile(filepath.Join(DIST, "isolinux", "isolinux.cfg"), filepath.Join(baseName, bootDir, "syslinux"), "syslinux.cfg"); err != nil {
@@ -1023,8 +1074,8 @@ func installRancher(baseName, bootDir, VERSION, DIST, kappend string) error {
 		err := ioutil.WriteFile(globalFile, []byte("APPEND "+kappend), 0644)
 		if err != nil {
 			log.Errorf("write (%s) %s", "global.cfg", err)
-			return err
+			return currentCfg, err
 		}
 	}
-	return nil
+	return currentCfg, nil
 }

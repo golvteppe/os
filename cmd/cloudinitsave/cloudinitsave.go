@@ -59,23 +59,19 @@ func Main() {
 		log.Errorf("Failed to run udev settle: %v", err)
 	}
 
-	cfg := rancherConfig.LoadConfig()
-	network.ApplyNetworkConfig(cfg)
-
-	if err := SaveCloudConfig(); err != nil {
+	if err := saveCloudConfig(); err != nil {
 		log.Errorf("Failed to save cloud-config: %v", err)
 	}
-
-	// Apply any newly detected network config.
-	//consider putting this in a separate init phase...
-	cfg = rancherConfig.LoadConfig()
-	network.ApplyNetworkConfig(cfg)
 }
 
-func SaveCloudConfig() error {
+func saveCloudConfig() error {
 	log.Debugf("SaveCloudConfig")
-	cfg := rancherConfig.LoadConfig()
 
+	cfg := rancherConfig.LoadConfig()
+	log.Debugf("init: SaveCloudConfig(pre ApplyNetworkConfig): %#v", cfg.Rancher.Network)
+	network.ApplyNetworkConfig(cfg)
+
+	log.Debugf("datasources that will be consided: %#v", cfg.Rancher.CloudInit.Datasources)
 	dss := getDatasources(cfg)
 	if len(dss) == 0 {
 		log.Errorf("currentDatasource - none found")
@@ -83,6 +79,12 @@ func SaveCloudConfig() error {
 	}
 
 	selectDatasource(dss)
+
+	// Apply any newly detected network config.
+	cfg = rancherConfig.LoadConfig()
+	log.Debugf("init: SaveCloudConfig(post ApplyNetworkConfig): %#v", cfg.Rancher.Network)
+	network.ApplyNetworkConfig(cfg)
+
 	return nil
 }
 
@@ -118,8 +120,7 @@ func saveFiles(cloudConfigBytes, scriptBytes []byte, metadata datasource.Metadat
 		if err := util.WriteFileAtomic(rancherConfig.CloudConfigBootFile, cloudConfigBytes, 400); err != nil {
 			return err
 		}
-		// TODO: Don't put secrets into the log
-		log.Infof("Written to %s:\n%s", rancherConfig.CloudConfigBootFile, string(cloudConfigBytes))
+		log.Infof("Wrote to %s", rancherConfig.CloudConfigBootFile)
 	}
 
 	metaDataBytes, err := yaml.Marshal(metadata)
@@ -130,8 +131,7 @@ func saveFiles(cloudConfigBytes, scriptBytes []byte, metadata datasource.Metadat
 	if err = util.WriteFileAtomic(rancherConfig.MetaDataFile, metaDataBytes, 400); err != nil {
 		return err
 	}
-	// TODO: Don't put secrets into the log
-	log.Infof("Written to %s:\n%s", rancherConfig.MetaDataFile, string(metaDataBytes))
+	log.Infof("Wrote to %s", rancherConfig.MetaDataFile)
 
 	// if we write the empty meta yml, the merge fails.
 	// TODO: the problem is that a partially filled one will still have merge issues, so that needs fixing - presumably by making merge more clever, and making more fields optional
@@ -164,7 +164,7 @@ func saveFiles(cloudConfigBytes, scriptBytes []byte, metadata datasource.Metadat
 	if err := rancherConfig.WriteToFile(cc, rancherConfig.CloudConfigNetworkFile); err != nil {
 		log.Errorf("Failed to save config file %s: %v", rancherConfig.CloudConfigNetworkFile, err)
 	}
-	log.Infof("Written to %s:", rancherConfig.CloudConfigNetworkFile)
+	log.Infof("Wrote to %s", rancherConfig.CloudConfigNetworkFile)
 
 	return nil
 }

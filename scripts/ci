@@ -3,20 +3,16 @@ set -e
 
 cd $(dirname $0)/..
 
+echo BUILD
 ./scripts/build
+echo TEST
 ./scripts/test
+echo VALIDATE
 ./scripts/validate
+echo PREPARE
 ./scripts/prepare
+echo PACKAGE
 ./scripts/package
+echo INTEGRATION-TEST
 ./scripts/integration-test
 
-echo "--- Run"
-echo "github-release release --user rancher --repo os --tag ${VERSION} --pre-release --draft"
-for file in $(ls dist/artifacts/); do
-	if [ "$file" != "installer.tar" ]; then
-		echo "github-release upload  --user rancher --repo os --tag ${VERSION} --file ./dist/artifacts/${file} --name ${file}"
-	fi
-done
-echo
-
-cat dist/images | sed 's/^/docker push /'

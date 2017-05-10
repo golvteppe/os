@@ -24,6 +24,7 @@ const (
 
 var (
 	defaultDhcpArgs = []string{"dhcpcd", "-MA4"}
+	dhcpReleaseCmd  = "dhcpcd --release"
 )
 
 func createInterfaces(netCfg *NetworkConfig) {
@@ -186,36 +187,57 @@ func ApplyNetworkConfigs(netCfg *NetworkConfig) error {
 }
 
 func RunDhcp(netCfg *NetworkConfig, setHostname, setDNS bool) error {
+	log.Debugf("RunDhcp")
 	populateDefault(netCfg)
 
 	links, err := netlink.LinkList()
 	if err != nil {
+		log.Errorf("RunDhcp failed to get LinkList, %s", err)
 		return err
 	}
 
-	dhcpLinks := map[string]string{}
-	for _, link := range links {
-		if match, ok := findMatch(link, netCfg); ok && match.DHCP {
-			dhcpLinks[link.Attrs().Name] = match.DHCPArgs
-		}
-	}
-
-	//run dhcp
 	wg := sync.WaitGroup{}
-	for iface, args := range dhcpLinks {
+
+	for _, link := range links {
+		name := link.Attrs().Name
+		if name == "lo" {
+			continue
+		}
+		match, ok := findMatch(link, netCfg)
+		if !ok {
+			continue
+		}
 		wg.Add(1)
-		go func(iface, args string) {
-			runDhcp(netCfg, iface, args, setHostname, setDNS)
+		go func(iface string, match InterfaceConfig) {
+			if match.DHCP {
+				// retrigger, perhaps we're running this to get the new address
+				runDhcp(netCfg, iface, match.DHCPArgs, setHostname, setDNS)
+			} else {
+				if hasDhcp(iface) {
+					log.Infof("dhcp release %s", iface)
+					runDhcp(netCfg, iface, dhcpReleaseCmd, false, true)
+				}
+			}
 			wg.Done()
-		}(iface, args)
+		}(name, match)
 	}
 	wg.Wait()
 
-	return err
+	return nil
+}
+
+func hasDhcp(iface string) bool {
+	cmd := exec.Command("dhcpcd", "-U", iface)
+	//cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		log.Error(err)
+	}
+	log.Debugf("dhcpcd -u %s: %s", iface, out)
+	return len(out) > 0
 }
 
 func runDhcp(netCfg *NetworkConfig, iface string, argstr string, setHostname, setDNS bool) {
-	log.Infof("Running DHCP on %s", iface)
 	args := []string{}
 	if argstr != "" {
 		var err error
@@ -238,6 +260,7 @@ func runDhcp(netCfg *NetworkConfig, iface string, argstr string, setHostname, se
 
 	args = append(args, iface)
 	cmd := exec.Command(args[0], args[1:]...)
+	log.Infof("Running DHCP on %s: %s", iface, strings.Join(args, " "))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -387,8 +410,13 @@ func applyInterfaceConfig(link netlink.Link, netConf InterfaceConfig) error {
 	}
 	for _, addr := range existingAddrs {
 		if _, ok := addrMap[addr.IPNet.String()]; !ok {
-			log.Infof("leaving  %s from %s", addr.String(), link.Attrs().Name)
-			//removeAddress(addr, link)
+			if netConf.DHCP || netConf.IPV4LL {
+				// let the dhcpcd take care of it
+				log.Infof("leaving  %s from %s", addr.String(), link.Attrs().Name)
+			} else {
+				log.Infof("removing  %s from %s", addr.String(), link.Attrs().Name)
+				removeAddress(addr, link)
+			}
 		}
 	}
 

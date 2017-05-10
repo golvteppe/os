@@ -11,7 +11,6 @@ import (
 
 func Main() {
 	log.InitLogger()
-	log.Infof("Running network")
 
 	cfg := config.LoadConfig()
 	ApplyNetworkConfig(cfg)
@@ -20,6 +19,7 @@ func Main() {
 }
 
 func ApplyNetworkConfig(cfg *config.CloudConfig) {
+	log.Infof("Apply Network Config")
 	nameservers := cfg.Rancher.Network.DNS.Nameservers
 	search := cfg.Rancher.Network.DNS.Search
 	userSetDNS := len(nameservers) > 0 || len(search) > 0
@@ -43,10 +43,12 @@ func ApplyNetworkConfig(cfg *config.CloudConfig) {
 
 	// TODO: seems wrong to do this outside netconf
 	userSetHostname := cfg.Hostname != ""
+	log.Infof("Apply Network Config RunDhcp")
 	if err := netconf.RunDhcp(&cfg.Rancher.Network, !userSetHostname, !userSetDNS); err != nil {
 		log.Error(err)
 	}
 
+	log.Infof("Apply Network Config SyncHostname")
 	if err := hostname.SyncHostname(); err != nil {
 		log.Error(err)
 	}
