@@ -4,7 +4,7 @@ pipeline {
     stages {
         stage('OS build') {
             steps {
-                sh 'make || true' 
+                sh 'make -d || true' 
             }
         }
     }
